@@ -11,17 +11,17 @@
 
 #include "model_adapter.h"
 
-static clock_t bench_timer = 0;
+static timespec bench_timer;
 
 void timer_start()
 {
-    bench_timer = clock();
+    clock_gettime(CLOCK_MONOTONIC, &bench_timer);
 }
 double timer_check()
 {
-    double ticks = clock() - bench_timer;
-    double time_taken = ((double)ticks) / CLOCKS_PER_SEC;
-    return time_taken;
+    timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)(t.tv_sec - bench_timer.tv_sec) + ((double)(t.tv_nsec - bench_timer.tv_nsec) / 1000000000.0);
 }
 
 void print_tok_vec(std::vector<int> &embd)
