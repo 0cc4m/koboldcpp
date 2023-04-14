@@ -10,6 +10,10 @@ ifndef UNAME_M
 UNAME_M := $(shell uname -m)
 endif
 
+ifndef ARCH_LINUX
+ARCH_LINUX := $(shell grep "Arch Linux" /etc/os-release 2>/dev/null)
+endif
+
 CCV := $(shell $(CC) --version | head -n 1)
 CXXV := $(shell $(CXX) --version | head -n 1)
 
@@ -40,7 +44,7 @@ BONUSCFLAGS1 =
 BONUSCFLAGS2 =
 
 #lets try enabling everything
-CFLAGS   += -pthread -s 
+CFLAGS   += -pthread -s
 CXXFLAGS += -pthread -s -Wno-multichar
 
 # OS specific
@@ -48,6 +52,9 @@ CXXFLAGS += -pthread -s -Wno-multichar
 ifeq ($(UNAME_S),Linux)
 	CFLAGS   += -pthread
 	CXXFLAGS += -pthread
+endif
+ifdef ARCH_LINUX
+	LDFLAGS += -lcblas
 endif
 ifeq ($(UNAME_S),Darwin)
 	CFLAGS   += -pthread
@@ -75,11 +82,11 @@ endif
 #       feel free to update the Makefile for your architecture and send a pull request or issue
 ifeq ($(UNAME_M),$(filter $(UNAME_M),x86_64 i686))
 	# Use all CPU extensions that are available:
-	CFLAGS += -mavx 
+	CFLAGS += -mavx
 # old library NEEDS mf16c to work. so we must build with it. new one doesnt
 	ifeq ($(OS),Windows_NT)
-		BONUSCFLAGS1 += -mf16c 
-		BONUSCFLAGS2 += -mavx2 -msse3 -mfma 
+		BONUSCFLAGS1 += -mf16c
+		BONUSCFLAGS2 += -mavx2 -msse3 -mfma
 	else
 # if not on windows, they are clearly building it themselves, so lets just use whatever is supported
 		CFLAGS += -march=native -mtune=native
@@ -135,7 +142,7 @@ endif
 
 OPENBLAS_BUILD =
 CLBLAST_BUILD =
-NOAVX2_BUILD = 
+NOAVX2_BUILD =
 OPENBLAS_NOAVX2_BUILD =
 
 ifeq ($(OS),Windows_NT)
@@ -204,10 +211,10 @@ common.o: examples/common.cpp examples/common.h
 expose.o: expose.cpp expose.h
 	$(CXX) $(CXXFLAGS) -c expose.cpp -o expose.o
 
-llama_adapter.o: 
+llama_adapter.o:
 	$(CXX) $(CXXFLAGS) -c llama_adapter.cpp -o llama_adapter.o
 
-gpttype_adapter.o: 
+gpttype_adapter.o:
 	$(CXX) $(CXXFLAGS) -c gpttype_adapter.cpp -o gpttype_adapter.o
 
 clean:
@@ -222,18 +229,18 @@ main: examples/main/main.cpp ggml.o llama.o common.o
 llamalib: ggml.o ggml_v1.o expose.o common.o llama_adapter.o gpttype_adapter.o
 	$(CXX) $(CXXFLAGS)  ggml.o ggml_v1.o expose.o common.o llama_adapter.o gpttype_adapter.o -shared -o koboldcpp.dll $(LDFLAGS)
 
-llamalib_openblas: ggml_openblas.o ggml_v1.o expose.o common.o llama_adapter.o gpttype_adapter.o 
+llamalib_openblas: ggml_openblas.o ggml_v1.o expose.o common.o llama_adapter.o gpttype_adapter.o
 	$(OPENBLAS_BUILD)
 
-llamalib_noavx2: ggml_noavx2.o ggml_v1_noavx2.o expose.o common.o llama_adapter.o gpttype_adapter.o 
+llamalib_noavx2: ggml_noavx2.o ggml_v1_noavx2.o expose.o common.o llama_adapter.o gpttype_adapter.o
 	$(NOAVX2_BUILD)
 
-llamalib_openblas_noavx2: ggml_openblas_noavx2.o ggml_v1_noavx2.o expose.o common.o llama_adapter.o gpttype_adapter.o 
+llamalib_openblas_noavx2: ggml_openblas_noavx2.o ggml_v1_noavx2.o expose.o common.o llama_adapter.o gpttype_adapter.o
 	$(OPENBLAS_NOAVX2_BUILD)
 
-llamalib_clblast: ggml_clblast.o ggml_v1.o expose.o common.o llama_adapter.o gpttype_adapter.o 
+llamalib_clblast: ggml_clblast.o ggml_v1.o expose.o common.o llama_adapter.o gpttype_adapter.o
 	$(CLBLAST_BUILD)
-	
+
 quantize_llama: examples/quantize/quantize.cpp ggml.o llama.o
 	$(CXX) $(CXXFLAGS) examples/quantize/quantize.cpp ggml.o llama.o -o quantize_llama $(LDFLAGS)
 
