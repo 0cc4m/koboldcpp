@@ -113,11 +113,11 @@ ifndef LLAMA_NO_ACCELERATE
 endif
 ifdef LLAMA_OPENBLAS
 	CFLAGS  += -DGGML_USE_OPENBLAS -I/usr/local/include/openblas
-	LDFLAGS += -lopenblas
+	LDFLAGS += -lblas
 endif
 ifdef LLAMA_CLBLAST
 	CFLAGS  += -DGGML_USE_CLBLAST -DGGML_USE_OPENBLAS
-	LDFLAGS += -lclblast -lOpenCL
+	LDFLAGS += -lclblast -lOpenCL -lblas
 endif
 ifdef LLAMA_GPROF
 	CFLAGS   += -pg
