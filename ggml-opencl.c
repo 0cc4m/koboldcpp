@@ -25,8 +25,8 @@ cl_context context;
 cl_command_queue queue;
 cl_program program;
 cl_kernel kernel_q4_0, kernel_q4_1, kernel_q4_2, kernel_q4_3;
-cl_mem cl_buffer_a, cl_buffer_qb, cl_buffer_b, cl_buffer_c;
-size_t cl_size_a = 0, cl_size_qb = 0, cl_size_b = 0, cl_size_c = 0;
+cl_mem cl_buffer_b, cl_buffer_c;
+size_t cl_size_b = 0, cl_size_c = 0;
 
 cl_program build_program_from_source(cl_context ctx, cl_device_id dev, const char* program_buffer) {
    cl_program p;
@@ -169,34 +169,29 @@ void ggml_cl_sgemm_wrapper(
     const size_t size_c =  m * n * sizeof(float);
 
     // Prepare buffers
-    ggml_cl_malloc(size_a, &cl_size_a, CL_MEM_READ_ONLY, &cl_buffer_a);
+    cl_mem cl_buffer_a = clCreateBuffer(context, CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY, size_a, host_a, &err);
+    CL_CHECK(err, "clCreateBuffer A");
+    cl_mem cl_buffer_qb;
     if (dequant) {
-        ggml_cl_malloc(size_qb, &cl_size_qb, CL_MEM_READ_ONLY, &cl_buffer_qb);
+        cl_buffer_qb = clCreateBuffer(context, CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY, size_qb, host_b, &err);
+        CL_CHECK(err, "clCreateBuffer qB");
+        ggml_cl_malloc(size_b, &cl_size_b, CL_MEM_READ_WRITE, &cl_buffer_b);
+    } else {
+        cl_buffer_b = clCreateBuffer(context, CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY, size_b, host_b, &err);
+        CL_CHECK(err, "clCreateBuffer B");
     }
-    ggml_cl_malloc(size_b, &cl_size_b, CL_MEM_READ_WRITE, &cl_buffer_b);
     ggml_cl_malloc(size_c, &cl_size_c, CL_MEM_WRITE_ONLY, &cl_buffer_c);
-
-    cl_event ev_a, ev_qb, ev_b;
 
     if (dequant) {
         err = clSetKernelArg(kernel, 0, sizeof(cl_mem), &cl_buffer_qb);
         err |= clSetKernelArg(kernel, 1, sizeof(cl_mem), &cl_buffer_b);
         CL_CHECK(err, "clSetKernelArg");
-        clEnqueueWriteBuffer(queue, cl_buffer_qb, CL_FALSE, 0, size_qb, host_b, 0, NULL, &ev_qb);
-    } else {
-        clEnqueueWriteBuffer(queue, cl_buffer_b, CL_FALSE, 0, size_b, host_b, 0, NULL, &ev_b);
-    }
-
-    clEnqueueWriteBuffer(queue, cl_buffer_a, CL_FALSE, 0, size_a, host_a, 0, NULL, &ev_a);
-    if (dequant) {
-        err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global, &local, 1, &ev_qb, &ev_b);
-        clReleaseEvent(ev_qb);
+        cl_event ev_b;
+        err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global, &local, 0, NULL, &ev_b);
         CL_CHECK(err, "clEnqueueNDRangeKernel");
+        clWaitForEvents(1, &ev_b);
+        clReleaseEvent(ev_b);
     }
-    clWaitForEvents(1, &ev_a);
-    clWaitForEvents(1, &ev_b);
-    clReleaseEvent(ev_a);
-    clReleaseEvent(ev_b);
 
     cl_event ev_sgemm;
     CLBlastSgemm((CLBlastLayout)order,
@@ -216,4 +211,11 @@ void ggml_cl_sgemm_wrapper(
     clWaitForEvents(1, &ev_c);
     clReleaseEvent(ev_sgemm);
     clReleaseEvent(ev_c);
+
+    clReleaseMemObject(cl_buffer_a);
+    if (dequant) {
+        clReleaseMemObject(cl_buffer_qb);
+    } else {
+        clReleaseMemObject(cl_buffer_b);
+    }
 }
