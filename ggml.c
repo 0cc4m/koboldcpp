@@ -21,6 +21,8 @@
 #include <float.h>
 #include <limits.h>
 
+#define GGML_USE_CLBLAST
+
 // if C99 - static_assert is noop
 // ref: https://stackoverflow.com/a/53923785/4039976
 #ifndef static_assert
@@ -7931,7 +7933,7 @@ static bool ggml_compute_forward_mul_mat_use_blas(
 
     // TODO: find the optimal values for these
     if (
-#if !defined(GGML_USE_CUBLAS)
+#if !defined(GGML_USE_CUBLAS) && !defined(GGML_USE_CLBLAST)
         ggml_is_contiguous(src0) &&
         ggml_is_contiguous(src1) &&
 #endif
@@ -8041,11 +8043,17 @@ static void ggml_compute_forward_mul_mat_f32(
         float *d_X = ggml_cuda_pool_malloc(sizeof(float) * x_ne, &x_size);
         float *d_Y = ggml_cuda_pool_malloc(sizeof(float) * y_ne, &y_size);
         float *d_D = ggml_cuda_pool_malloc(sizeof(float) * d_ne, &d_size);
+#elif defined(GGML_USE_CLBLAST)
+        const int size_x = ne01 * ne00;
+        const int size_y = ne11 * ne10;
+        const int size_d = ne11 * ne01;
+        ggml_cl_blas_setup(size_x, size_y, size_d, GGML_TYPE_F32);
+        float * const wdata = params->wdata;
 #endif
 
         for (int64_t i03 = 0; i03 < ne03; i03++) {
             for (int64_t i02 = 0; i02 < ne02; i02++) {
-#if !defined(GGML_USE_CUBLAS)
+#if !defined(GGML_USE_CUBLAS) && !defined(GGML_USE_CLBLAST)
                 const float * x = (float *) ((char *) src0->data + i02*nb02 + i03*nb03);
                 const float * y = (float *) ((char *) src1->data + i02*nb12 + i03*nb13);
 #endif
@@ -8067,11 +8075,12 @@ static void ggml_compute_forward_mul_mat_f32(
                 // copy data to host
                 CUDA_CHECK(cudaMemcpyAsync(d, d_D, sizeof(float) * d_ne, cudaMemcpyDeviceToHost, g_cudaStream));
 #elif defined(GGML_USE_CLBLAST)
+                ggml_cl_blas_init_dequant(src0, src1, i03, i02, GGML_TYPE_F32);
                 // zT = y * xT
-                ggml_cl_sgemm_wrapper(GGML_BLAS_ORDER_ROW_MAJOR, GGML_BLAS_OP_N, GGML_BLAS_OP_T,
+                ggml_cl_blas_run(GGML_BLAS_ORDER_COLUMN_MAJOR, GGML_BLAS_OP_T, GGML_BLAS_OP_N,
                         ne11, ne01, ne10,
-                        1.0f,    y, ne10,
-                                 x, ne10,
+                        1.0f,    ne10,
+                                 ne10,
                         0.0f,    d, ne01,
                         GGML_TYPE_F32);
 #else
@@ -8088,6 +8097,8 @@ static void ggml_compute_forward_mul_mat_f32(
         ggml_cuda_pool_free(d_X, x_size);
         ggml_cuda_pool_free(d_Y, y_size);
         ggml_cuda_pool_free(d_D, d_size);
+#elif defined(GGML_USE_CLBLAST)
+        ggml_cl_blas_cleanup(GGML_TYPE_F32);
 #endif
         //printf("CBLAS F32 = %f ms, %d x %d x %d x %d\n", (ggml_perf_time_us() - t0)/1000.0, ne0, ne1, ne2, ne3);
 
@@ -8245,6 +8256,11 @@ static void ggml_compute_forward_mul_mat_f16_f32(
         ggml_fp16_t * d_X = ggml_cuda_pool_malloc(sizeof(float) * x_ne, &x_size);
         ggml_fp16_t * d_Y = ggml_cuda_pool_malloc(sizeof(float) * y_ne, &y_size);
         float       * d_D = ggml_cuda_pool_malloc(sizeof(float) * d_ne, &d_size);
+#elif defined(GGML_USE_CLBLAST)
+        const int size_x = ne01 * ne00;
+        const int size_y = ne11 * ne10;
+        const int size_d = ne11 * ne01;
+        ggml_cl_blas_setup(size_x, size_y, size_d, ggml_cl_fp16() ? GGML_TYPE_F16 : GGML_TYPE_F32);
 #else
         float * const wdata = params->wdata;
 #endif
@@ -8261,6 +8277,25 @@ static void ggml_compute_forward_mul_mat_f16_f32(
                     for (int64_t i01 = 0; i01 < ne11; ++i01) {
                         for (int64_t i00 = 0; i00 < ne10; ++i00) {
                             wdata[id++] = GGML_FP32_TO_FP16(*(float *) ((char *) src1->data + i03*nb13 + i02*nb12 + i01*nb11 + i00*nb10));
+                        }
+                    }
+                }
+#elif defined(GGML_USE_CLBLAST)
+                // with CLBlast, if fp16 supported, instead of converting src0 to fp32, we convert src1 to fp16
+                if (ggml_cl_fp16()) {
+                    ggml_fp16_t * const wdata = (ggml_fp16_t *) params->wdata;
+                    size_t id = 0;
+                    for (int64_t i01 = 0; i01 < ne11; ++i01) {
+                        for (int64_t i00 = 0; i00 < ne10; ++i00) {
+                            wdata[id++] = GGML_FP32_TO_FP16(*(float *) ((char *) src1->data + i03*nb13 + i02*nb12 + i01*nb11 + i00*nb10));
+                        }
+                    }
+                } else {
+                    float * const wdata = (float *) params->wdata;
+                    size_t id = 0;
+                    for (int64_t i01 = 0; i01 < ne01; ++i01) {
+                        for (int64_t i00 = 0; i00 < ne00; ++i00) {
+                            wdata[id++] = GGML_FP16_TO_FP32(*(ggml_fp16_t *) ((char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01 + i00*nb00));
                         }
                     }
                 }
@@ -8295,18 +8330,29 @@ static void ggml_compute_forward_mul_mat_f16_f32(
                 // copy data to host
                 CUDA_CHECK(cudaMemcpyAsync(d, d_D, sizeof(float) * d_ne, cudaMemcpyDeviceToHost, g_cudaStream));
 #elif defined(GGML_USE_CLBLAST)
-                const float * x = wdata;
-                const float * y = (float *) ((char *) src1->data + i02*nb12 + i03*nb13);
-
                 float * d = (float *) ((char *) dst->data + i02*nb2 + i03*nb3);
 
-                // zT = y * xT
-                ggml_cl_sgemm_wrapper(GGML_BLAS_ORDER_ROW_MAJOR, GGML_BLAS_OP_N, GGML_BLAS_OP_T,
-                        ne11, ne01, ne10,
-                        1.0f,    y, ne10,
-                                 x, ne10,
-                        0.0f,    d, ne01,
-                        GGML_TYPE_F32);
+                if (ggml_cl_fp16()) {
+                    ggml_cl_blas_init_tensor(src0, i03, i02, true);
+                    ggml_cl_blas_init_buffer(params->wdata, size_y, false);
+                    // zT = y * xT
+                    ggml_cl_blas_run(GGML_BLAS_ORDER_COLUMN_MAJOR, GGML_BLAS_OP_T, GGML_BLAS_OP_N,
+                            ne01, ne11, ne10,
+                            1.0f,    ne00,
+                                     ne10,
+                            0.0f,    d, ne01,
+                            GGML_TYPE_F16);
+                } else {
+                    ggml_cl_blas_init_buffer(params->wdata, size_x, true);
+                    ggml_cl_blas_init_tensor(src1, i03, i02, false);
+                    // zT = y * xT
+                    ggml_cl_blas_run(GGML_BLAS_ORDER_COLUMN_MAJOR, GGML_BLAS_OP_T, GGML_BLAS_OP_N,
+                            ne01, ne11, ne10,
+                            1.0f,    ne00,
+                                     ne10,
+                            0.0f,    d, ne01,
+                            GGML_TYPE_F32);
+                }
 #else
                 const float * x = wdata;
                 const float * y = (float *) ((char *) src1->data + i02*nb12 + i03*nb13);
@@ -8328,6 +8374,8 @@ static void ggml_compute_forward_mul_mat_f16_f32(
         ggml_cuda_pool_free(d_X, x_size);
         ggml_cuda_pool_free(d_Y, y_size);
         ggml_cuda_pool_free(d_D, d_size);
+#elif defined(GGML_USE_CLBLAST)
+        ggml_cl_blas_cleanup(GGML_TYPE_F32);
 #endif
         /*printf("CBLAS F16 = %f ms, %d x %d x %d x %d\n", (ggml_perf_time_us() - t0)/1000.0, ne0, ne1, ne2, ne3);*/
 
@@ -8510,6 +8558,11 @@ static void ggml_compute_forward_mul_mat_q_f32(
 
         const dequantize_row_q_cuda_t dequantize_row_q_cuda = ggml_get_dequantize_row_q_cuda(type);
         GGML_ASSERT(dequantize_row_q_cuda != NULL);
+#elif defined(GGML_USE_CLBLAST)
+        const int size_x = ne01 * ne00;
+        const int size_y = ne11 * ne10;
+        const int size_d = ne11 * ne01;
+        ggml_cl_blas_setup(size_x, size_y, size_d, type);
 #else
         float * const wdata = params->wdata;
         dequantize_row_q_t const dequantize_row_q = quantize_fns[type].dequantize_row_q;
@@ -8529,7 +8582,7 @@ static void ggml_compute_forward_mul_mat_q_f32(
                 CUDA_CHECK(cudaGetLastError());
                 CUDA_CHECK(cudaEventRecord(g_cudaEvent, g_cudaStream2));
 #elif defined(GGML_USE_CLBLAST)
-                const void* x = (char *) src0->data + i03*nb03 + i02*nb02;
+                ggml_cl_blas_init_dequant(src0, src1, i03, i02, type);
 #else
                 {
                     size_t id = 0;
@@ -8560,12 +8613,12 @@ static void ggml_compute_forward_mul_mat_q_f32(
                 CUDA_CHECK(cudaMemcpyAsync(d, d_D, sizeof(float) * d_ne, cudaMemcpyDeviceToHost, g_cudaStream));
 #elif defined(GGML_USE_CLBLAST)
                 // zT = y * xT
-                ggml_cl_sgemm_wrapper(GGML_BLAS_ORDER_ROW_MAJOR, GGML_BLAS_OP_N, GGML_BLAS_OP_T,
-                        ne11, ne01, ne10,
-                        1.0f,    y, ne10,
-                                 x, ne10,
+                ggml_cl_blas_run(GGML_BLAS_ORDER_COLUMN_MAJOR, GGML_BLAS_OP_T, GGML_BLAS_OP_N,
+                        ne01, ne11, ne10,
+                        1.0f,    ne00,
+                                 ne10,
                         0.0f,    d, ne01,
-                        type);
+                        GGML_TYPE_F32);
 #else
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         ne11, ne01, ne10,
@@ -8582,6 +8635,8 @@ static void ggml_compute_forward_mul_mat_q_f32(
         ggml_cuda_pool_free(d_Y, y_size);
         ggml_cuda_pool_free(d_D, d_size);
         ggml_cuda_pool_free(d_Q, q_size);
+#elif defined(GGML_USE_CLBLAST)
+        ggml_cl_blas_cleanup(type);
 #endif
         //printf("CBLAS = %f ms, %d x %d x %d x %d\n", (ggml_perf_time_us() - t0)/1000.0, ne0, ne1, ne2, ne3);
 

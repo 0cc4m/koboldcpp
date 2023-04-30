@@ -1,12 +1,9 @@
 #include "ggml-opencl.h"
 
-#define CL_TARGET_OPENCL_VERSION 110
-#include <clblast_c.h>
+#include <clblast_half.h>
 
 #include <stdio.h>
 #include <string.h>
-
-#include "ggml.h"
 
 #define MULTILINE_QUOTE(...) #__VA_ARGS__
 const char * clblast_dequant = MULTILINE_QUOTE(
@@ -157,18 +154,25 @@ typedef struct {
 
 typedef struct {
     float d;                // delta
-    uint32_t qh;          // 5-th bit of quants
+    uint32_t qh;            // 5-th bit of quants
     uint8_t qs[QK5_0 / 2];  // nibbles / quants
 } cl_block_q5_0;
 
 static cl_platform_id platform;
 static cl_device_id device;
+static bool fp16_support;
 static cl_context context;
 static cl_command_queue queue;
 static cl_program program;
 static cl_kernel kernel_q4_0, kernel_q4_1, kernel_q4_2, kernel_q5_0, kernel_q5_1, kernel_q8_0;
-static cl_mem cl_buffer_a, cl_buffer_qb, cl_buffer_b, cl_buffer_c;
-static size_t cl_size_a = 0, cl_size_qb = 0, cl_size_b = 0, cl_size_c = 0;
+static cl_mem cl_buffer_a, cl_buffer_qa, cl_buffer_b, cl_buffer_c;
+static size_t cl_size_a = 0, cl_size_qa = 0, cl_size_b = 0, cl_size_c = 0;
+
+static cl_kernel kernel;
+static size_t global, local, size_qa;
+static bool dequant;
+static bool fp16;
+static cl_block_q5_0* cl_host_a;
 
 static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, const char* program_buffer) {
     cl_program p;
@@ -221,7 +225,19 @@ void ggml_cl_init(void) {
     device = devices[dev_num];
     char device_buffer[1024];
     clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(device_buffer), &device_buffer, NULL);
-    printf("Using Platform: %s Device: %s\n", platform_buffer, device_buffer);
+    size_t ext_str_size;
+    clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, 0, NULL, &ext_str_size);
+    char* ext_buffer = (char*) malloc(sizeof(char) * ext_str_size);
+    clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, ext_str_size, ext_buffer, NULL);
+    // Check if ext_buffer contains cl_khr_fp16
+    for (size_t i = 0; i < ext_str_size - 12; i++) {
+        if (memcmp(ext_buffer + i, "cl_khr_fp16", 11) == 0) {
+            fp16_support = true;
+            break;
+        }
+    }
+    free(ext_buffer);
+    printf("Using Platform: %s Device: %s FP16: %d\n", platform_buffer, device_buffer, fp16_support);
     context = clCreateContext(NULL, 1, &device, NULL, NULL, &err);
     CL_CHECK(err, "clCreateContext");
     queue = clCreateCommandQueue(context, device, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, &err);
@@ -247,6 +263,10 @@ void ggml_cl_init(void) {
     CL_CHECK(err, "clCreateKernel");
 }
 
+bool ggml_cl_fp16(void) {
+    return fp16_support;
+}
+
 static void ggml_cl_malloc(size_t req_size, size_t* cur_size, cl_mem_flags flags, cl_mem* buf) {
     if (req_size <= *cur_size) {
         return;
@@ -262,20 +282,54 @@ static void ggml_cl_malloc(size_t req_size, size_t* cur_size, cl_mem_flags flags
     CL_CHECK(err, "clCreateBuffer");
 }
 
-void ggml_cl_sgemm_wrapper(
-        const enum ggml_blas_order order, const enum ggml_blas_op trans_a, const enum ggml_blas_op trans_b,
-        const int m, const int n, const int k,
-        const float alpha, const void *host_a, const int lda,
-        const float *host_b, const int ldb, const float beta,
-        float *host_c, const int ldc, const int btype) {
-    cl_int err = 0;
+static cl_int ggml_cl_h2d_tensor_2d(cl_command_queue queue, cl_mem dst, const struct ggml_tensor * src, uint64_t i3, uint64_t i2, cl_event* ev) {
+    cl_int err;
+    const uint64_t ne0 = src->ne[0];
+    const uint64_t ne1 = src->ne[1];
+    const uint64_t nb0 = src->nb[0];
+    const uint64_t nb1 = src->nb[1];
+    const uint64_t nb2 = src->nb[2];
+    const uint64_t nb3 = src->nb[3];
+    const enum ggml_type type = src->type;
+    const size_t ts = ggml_type_size(type);
+    const size_t bs = ggml_blck_size(type);
 
-    cl_kernel kernel;
-    size_t global = n * k, local, size_qb;
-    bool dequant;
-    cl_block_q5_0* cl_host_b;
+    const void * x = (const void *) ((const char *) src->data + i2*nb2 + i3*nb3);
+    if (nb0 == ts && nb1 == ts*ne0/bs) {
+        err = clEnqueueWriteBuffer(queue, dst, CL_FALSE, 0, ne1*nb1, x, 0, NULL, ev);
+        return err;
+    } else if (nb0 == ts) {
+        const size_t origin[3] = { 0, 0, 0 };
+        const size_t region[3] = { ts*ne0/bs, ne1, 1 };
+        err = clEnqueueWriteBufferRect(queue, dst, CL_FALSE, origin, origin, region, ts*ne0/bs, 0, nb1, 0, x, 0, NULL, ev);
+        return err;
+    } else {
+        for (uint64_t i1 = 0; i1 < ne1; i1++) {
+            // pretend the row is a matrix with cols=1
+            const size_t buffer_origin[3] = { 0, i1, 0 };
+            const size_t host_origin[3] = { 0, 0, 0 };
+            const size_t region[3] = { ts/bs, ne0, 1 };
+            err = clEnqueueWriteBufferRect(queue, dst, CL_FALSE, buffer_origin, host_origin, region, 0, 0, nb0, 0, ((const char *)x) + i1*nb0, 0, NULL, ev);
+            if (err != CL_SUCCESS) {
+                break;
+            }
+        }
+        return err;
+    }
+}
+
+void ggml_cl_blas_setup(size_t size_a, size_t size_b, size_t size_c, int btype) {
+    global = size_a;
+
+    fp16 = false;
 
     switch (btype) {
+    case GGML_TYPE_F16:
+        dequant = false;
+        if (fp16_support) {
+            fp16 = true;
+        }
+        break;
     case GGML_TYPE_F32:
         dequant = false;
         break;
@@ -283,114 +337,168 @@ void ggml_cl_sgemm_wrapper(
         dequant = true;
         kernel = kernel_q4_0;
         local = 16;
-        size_qb = global * (sizeof(float) + local) / 32;
+        size_qa = global * (sizeof(float) + local) / 32;
         break;
     case GGML_TYPE_Q4_1:
         dequant = true;
         kernel = kernel_q4_1;
         local = 16;
-        size_qb = global * (sizeof(float) * 2 + local) / 32;
+        size_qa = global * (sizeof(float) * 2 + local) / 32;
         break;
     case GGML_TYPE_Q4_2:
         dequant = true;
         kernel = kernel_q4_2;
         local = 8;
-        size_qb = global * (sizeof(ggml_fp16_t) + local) / 16;
+        size_qa = global * (sizeof(ggml_fp16_t) + local) / 16;
         break;
     case GGML_TYPE_Q5_0:
         dequant = true;
         kernel = kernel_q5_0;
         local = 16;
-        // For some reason OpenCL seems to be incapable of working with structs of size 22.
-        // 20 and 24 bytes are fine. Workaround to do the fp16 to fp32 step on CPU...
-        // TODO Find the reason, fix and remove workaround.
-        const block_q5_0* b = (const block_q5_0*) host_b;
-        cl_host_b = (cl_block_q5_0*) malloc(sizeof(cl_block_q5_0) * global / 32);
-        for (size_t i = 0; i < global / 32; i++) {
-            cl_host_b[i].d = ggml_fp16_to_fp32(b[i].d);
-            memcpy(&cl_host_b[i].qh, b[i].qh, sizeof(uint32_t) + QK5_0 / 2);
-        }
-        host_b = (const float*) cl_host_b;
-        size_qb = global * (sizeof(float) + sizeof(uint32_t) + local) / 32;
+        cl_host_a = (cl_block_q5_0*) malloc(sizeof(cl_block_q5_0) * global / 32);
+        size_qa = global * (sizeof(float) + sizeof(uint32_t) + local) / 32;
         break;
     case GGML_TYPE_Q5_1:
         dequant = true;
         kernel = kernel_q5_1;
         local = 16;
-        size_qb = global * (sizeof(ggml_fp16_t) * 2 + sizeof(uint32_t) + local) / 32;
+        size_qa = global * (sizeof(ggml_fp16_t) * 2 + sizeof(uint32_t) + local) / 32;
         break;
     case GGML_TYPE_Q8_0:
         dequant = true;
         kernel = kernel_q8_0;
         local = 32;
-        size_qb = global * (sizeof(float) + local) / 32;
+        size_qa = global * (sizeof(float) + local) / 32;
         break;
     default:
         fprintf(stderr, "Error: Unsupported OpenCL btype %d\n", btype);
         abort();
     }
 
-    const size_t size_a =  m * k * sizeof(float);
-    const size_t size_b =  n * k * sizeof(float);
-    const size_t size_c =  m * n * sizeof(float);
-
     // Prepare buffers
-    ggml_cl_malloc(size_a, &cl_size_a, CL_MEM_READ_ONLY, &cl_buffer_a);
     if (dequant) {
-        ggml_cl_malloc(size_qb, &cl_size_qb, CL_MEM_READ_ONLY, &cl_buffer_qb);
+        ggml_cl_malloc(size_qa, &cl_size_qa, CL_MEM_READ_ONLY, &cl_buffer_qa);
     }
-    ggml_cl_malloc(size_b, &cl_size_b, CL_MEM_READ_WRITE, &cl_buffer_b);
-    ggml_cl_malloc(size_c, &cl_size_c, CL_MEM_WRITE_ONLY, &cl_buffer_c);
+    ggml_cl_malloc((fp16 ? sizeof(ggml_fp16_t) : sizeof(float)) * size_a, &cl_size_a, CL_MEM_READ_WRITE, &cl_buffer_a);
+    ggml_cl_malloc((fp16 ? sizeof(ggml_fp16_t) : sizeof(float)) * size_b, &cl_size_b, CL_MEM_READ_ONLY, &cl_buffer_b);
+    ggml_cl_malloc((fp16 ? sizeof(ggml_fp16_t) : sizeof(float)) * size_c, &cl_size_c, CL_MEM_WRITE_ONLY, &cl_buffer_c);
+}
 
-    cl_event ev_a, ev_qb, ev_b;
+void ggml_cl_blas_init_buffer(const void* host, size_t size, bool buffer_a) {
+    cl_int err;
 
-    if (dequant) {
-        err = clSetKernelArg(kernel, 0, sizeof(cl_mem), &cl_buffer_qb);
-        err |= clSetKernelArg(kernel, 1, sizeof(cl_mem), &cl_buffer_b);
-        CL_CHECK(err, "clSetKernelArg");
-        err = clEnqueueWriteBuffer(queue, cl_buffer_qb, CL_FALSE, 0, size_qb, host_b, 0, NULL, &ev_qb);
-        CL_CHECK(err, "clEnqueueWriteBuffer qb");
-    } else {
-        err = clEnqueueWriteBuffer(queue, cl_buffer_b, CL_FALSE, 0, size_b, host_b, 0, NULL, &ev_b);
-        CL_CHECK(err, "clEnqueueWriteBuffer b");
-    }
-
-    err = clEnqueueWriteBuffer(queue, cl_buffer_a, CL_FALSE, 0, size_a, host_a, 0, NULL, &ev_a);
+    err = clEnqueueWriteBuffer(queue, buffer_a ? cl_buffer_a : cl_buffer_b, CL_FALSE, 0, (fp16 ? sizeof(ggml_fp16_t) : sizeof(float)) * size, host, 0, NULL, NULL);
     CL_CHECK(err, "clEnqueueWriteBuffer a");
+}
+void ggml_cl_blas_init_tensor(const struct ggml_tensor* host, uint64_t i3, uint64_t i2, bool buffer_a) {
+    cl_int err;
+
+    err = ggml_cl_h2d_tensor_2d(queue, buffer_a ? cl_buffer_a : cl_buffer_b, host, i3, i2, NULL);
+    CL_CHECK(err, "ggml_cl_h2d_tensor_2d b");
+}
+
+void ggml_cl_blas_init_dequant(const struct ggml_tensor* host_a, const struct ggml_tensor* host_b, uint64_t i3, uint64_t i2, int btype) {
+    cl_int err;
+    cl_event ev_qa;
+
     if (dequant) {
-        err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global, &local, 1, &ev_qb, &ev_b);
-        CL_CHECK(err, "clEnqueueNDRangeKernel");
-        clReleaseEvent(ev_qb);
+        if (btype == GGML_TYPE_Q5_0) {
+            // For some reason OpenCL seems to be incapable of working with structs of size 22.
+            // 20 and 24 bytes are fine. Workaround to do the fp16 to fp32 step on CPU...
+            // TODO Find the reason, fix and remove workaround.
+            const block_q5_0* a = (const block_q5_0*) host_a;
+            for (size_t i = 0; i < global / 32; i++) {
+                cl_host_a[i].d = ggml_fp16_to_fp32(a[i].d);
+                memcpy(&cl_host_a[i].qh, a[i].qh, sizeof(uint32_t) + QK5_0 / 2);
+            }
+            host_a = (const float*) cl_host_a;
+        }
+        err = ggml_cl_h2d_tensor_2d(queue, cl_buffer_qa, host_a, i3, i2, &ev_qa);
+        CL_CHECK(err, "ggml_cl_h2d_tensor_2d qa");
+    } else {
+        err = ggml_cl_h2d_tensor_2d(queue, cl_buffer_a, host_a, i3, i2, NULL);
+        CL_CHECK(err, "ggml_cl_h2d_tensor_2d a");
     }
-    clWaitForEvents(1, &ev_a);
-    clWaitForEvents(1, &ev_b);
-    clReleaseEvent(ev_a);
-    clReleaseEvent(ev_b);
 
-    cl_event ev_sgemm;
-    CLBlastStatusCode status = CLBlastSgemm((CLBlastLayout)order,
-                                            (CLBlastTranspose)trans_a, (CLBlastTranspose)trans_b,
-                                            m, n, k,
-                                            alpha,
-                                            cl_buffer_a, 0, lda,
-                                            cl_buffer_b, 0, ldb,
-                                            beta,
-                                            cl_buffer_c, 0, ldc,
-                                            &queue, &ev_sgemm);
+    err = ggml_cl_h2d_tensor_2d(queue, cl_buffer_b, host_b, i3, i2, NULL);
+    CL_CHECK(err, "ggml_cl_h2d_tensor_2d b");
+    if (dequant) {
+        err = clSetKernelArg(kernel, 0, sizeof(cl_mem), &cl_buffer_qa);
+        err |= clSetKernelArg(kernel, 1, sizeof(cl_mem), &cl_buffer_a);
+        CL_CHECK(err, "clSetKernelArg");
+        err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global, &local, 1, &ev_qa, NULL);
+        CL_CHECK(err, "clEnqueueNDRangeKernel");
+        clReleaseEvent(ev_qa);
+    }
+}
 
-    if (status != CLBlastSuccess) {
-        fprintf(stderr, "Error: CLBlast SGEMM %d\n", status);
+void ggml_cl_blas_run(
+        const enum ggml_blas_order order, const enum ggml_blas_op trans_a, const enum ggml_blas_op trans_b,
+        const int m, const int n, const int k,
+        const float alpha, const int lda,
+                           const int ldb,
+        const float beta, float *host_c, const int ldc,
+        const int btype) {
+    cl_int err = 0;
+    cl_event ev_gemm, ev_c;
+
+    clFinish(queue);
+
+    if (btype == GGML_TYPE_F32) {
+        CLBlastStatusCode status = CLBlastSgemm((CLBlastLayout)order,
+                                                (CLBlastTranspose)trans_a, (CLBlastTranspose)trans_b,
+                                                m, n, k,
+                                                alpha,
+                                                cl_buffer_a, 0, lda,
+                                                cl_buffer_b, 0, ldb,
+                                                beta,
+                                                cl_buffer_c, 0, ldc,
+                                                &queue, &ev_gemm);
+
+        if (status != CLBlastSuccess) {
+            fprintf(stderr, "Error: CLBlast SGEMM %d\n", status);
+            abort();
+        }
+
+        clEnqueueReadBuffer(queue, cl_buffer_c, CL_TRUE, 0, sizeof(float) * m * n, host_c, 1, &ev_gemm, &ev_c);
+    } else if (btype == GGML_TYPE_F16) {
+        CLBlastStatusCode status = CLBlastHgemm((CLBlastLayout)order,
+                                                (CLBlastTranspose)trans_a, (CLBlastTranspose)trans_b,
+                                                m, n, k,
+                                                FloatToHalf(alpha),
+                                                cl_buffer_a, 0, lda,
+                                                cl_buffer_b, 0, ldb,
+                                                FloatToHalf(beta),
+                                                cl_buffer_c, 0, ldc,
+                                                &queue, &ev_gemm);
+
+        if (status != CLBlastSuccess) {
+            fprintf(stderr, "Error: CLBlast HGEMM %d\n", status);
+            abort();
+        }
+
+        cl_half* buffer = (cl_half*) malloc(sizeof(cl_half) * m * n);
+
+        clEnqueueReadBuffer(queue, cl_buffer_c, CL_TRUE, 0, sizeof(cl_half) * m * n, buffer, 1, &ev_gemm, &ev_c);
+
+        for (size_t i = 0; i < (size_t)(m * n); i++) {
+            host_c[i] = HalfToFloat(buffer[i]);
+        }
+
+        free(buffer);
+    } else {
+        fprintf(stderr, "Error: Unsupported CLBlast GEMM type %d\n", btype);
         abort();
     }
 
-    cl_event ev_c;
-    clEnqueueReadBuffer(queue, cl_buffer_c, CL_TRUE, 0, size_c, host_c, 1, &ev_sgemm, &ev_c);
-
     // Wait for completion
     clWaitForEvents(1, &ev_c);
-    clReleaseEvent(ev_sgemm);
+    clReleaseEvent(ev_gemm);
     clReleaseEvent(ev_c);
+}
+
+void ggml_cl_blas_cleanup(int btype) {
     if (btype == GGML_TYPE_Q5_0) {
-        free((void*) cl_host_b);
+        free((void*) cl_host_a);
     }
 }
