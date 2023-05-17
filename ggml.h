@@ -436,6 +436,8 @@ extern "C" {
     // TODO: temporary until model loading of ggml examples is refactored
     GGML_API enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype);
 
+    GGML_API void ggml_init_aux(void);
+
     // main
 
     GGML_API struct ggml_context * ggml_init(struct ggml_init_params params);
