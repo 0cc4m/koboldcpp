@@ -399,12 +399,14 @@ void* ggml_cl_host_malloc(size_t size, cl_mem* cl_mem_obj) {
         return nullptr;
     }
 
+    CL_CHECK(clReleaseMemObject(*cl_mem_obj), "clReleaseMemObject");
+
     return ptr;
 }
 
 void ggml_cl_host_free(void * ptr, cl_mem* cl_mem_obj) {
-    CL_CHECK(clEnqueueUnmapMemObject(cl_queue, *cl_mem_obj, ptr, 0, NULL, NULL), "clEnqueueUnmapMemObject");
-    CL_CHECK(clReleaseMemObject(*cl_mem_obj), "clReleaseMemObject");
+    // CL_CHECK(clEnqueueUnmapMemObject(cl_queue, *cl_mem_obj, ptr, 0, NULL, NULL), "clEnqueueUnmapMemObject");
+    // CL_CHECK(clReleaseMemObject(*cl_mem_obj), "clReleaseMemObject");
 }
 
 static cl_kernel* ggml_get_to_fp32_cl(ggml_type type) {
