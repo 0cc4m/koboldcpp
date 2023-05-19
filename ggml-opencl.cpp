@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <sstream>
+#include <unordered_map>
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -273,6 +274,8 @@ static cl_kernel dequantize_row_q4_0_cl, dequantize_row_q4_1_cl, dequantize_row_
 static cl_kernel dequantize_mul_mat_vec_q4_0_cl, dequantize_mul_mat_vec_q4_1_cl, dequantize_mul_mat_vec_q5_0_cl, dequantize_mul_mat_vec_q5_1_cl, dequantize_mul_mat_vec_q8_0_cl, convert_mul_mat_vec_f16_cl;
 static bool fp16_support;
 
+static std::unordered_map<const void*, cl_mem> cl_mem_map;
+
 static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, const char* program_buffer) {
     cl_program p;
     char *program_log;
@@ -382,7 +385,7 @@ void ggml_cl_init(void) {
     CL_CHECK(err, "clCreateKernel");
 }
 
-void* ggml_cl_host_malloc(size_t size, cl_mem* cl_mem_obj) {
+void* ggml_cl_host_malloc(size_t size) {
     if (getenv("GGML_CL_NO_PINNED") != nullptr) {
         return nullptr;
     }
@@ -390,8 +393,8 @@ void* ggml_cl_host_malloc(size_t size, cl_mem* cl_mem_obj) {
     cl_int err1;
     cl_int err2;
     void* ptr = nullptr;
-    *cl_mem_obj = clCreateBuffer(cl_ctx, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, size, NULL, &err1);
-    ptr = (uint8_t*) clEnqueueMapBuffer(cl_queue, *cl_mem_obj, CL_TRUE, CL_MAP_WRITE, 0, size, 0, NULL, NULL, &err2);
+    cl_mem cl_mem_obj = clCreateBuffer(cl_ctx, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, size, NULL, &err1);
+    ptr = (uint8_t*) clEnqueueMapBuffer(cl_queue, cl_mem_obj, CL_TRUE, CL_MAP_WRITE, 0, size, 0, NULL, NULL, &err2);
     CL_CHECK(clFinish(cl_queue), "clFinish");
     if ((err1 | err2) != CL_SUCCESS) {
         fprintf(stderr, "WARNING: failed to allocate %.2f MB of pinned memory: %d %d\n",
@@ -399,12 +402,29 @@ void* ggml_cl_host_malloc(size_t size, cl_mem* cl_mem_obj) {
         return nullptr;
     }
 
+    cl_mem_map.insert({ptr, cl_mem_obj});
+
     return ptr;
 }
 
-void ggml_cl_host_free(void * ptr, cl_mem* cl_mem_obj) {
-    CL_CHECK(clEnqueueUnmapMemObject(cl_queue, *cl_mem_obj, ptr, 0, NULL, NULL), "clEnqueueUnmapMemObject");
-    CL_CHECK(clReleaseMemObject(*cl_mem_obj), "clReleaseMemObject");
+void ggml_cl_host_free(void* ptr) {
+    if (cl_mem_map.find(ptr) != cl_mem_map.end()) {
+        fprintf(stderr, "WARNING: to free pinned memory: memory not in map\n");
+        return;
+    }
+
+    cl_mem& cl_mem_obj = cl_mem_map[ptr];
+
+    CL_CHECK(clEnqueueUnmapMemObject(cl_queue, cl_mem_obj, ptr, 0, NULL, NULL), "clEnqueueUnmapMemObject");
+    CL_CHECK(clFinish(cl_queue), "clFinish");
+    CL_CHECK(clReleaseMemObject(cl_mem_obj), "clReleaseMemObject");
+}
+
+static cl_mem* ggml_cl_host_mem(const void* ptr) {
+    if (cl_mem_map.find(ptr) != cl_mem_map.end()) {
+        return nullptr;
+    }
+    return &cl_mem_map[ptr];
 }
 
 static cl_kernel* ggml_get_to_fp32_cl(ggml_type type) {
@@ -470,9 +490,15 @@ struct cl_buffer {
 static cl_buffer g_cl_buffer_pool[MAX_CL_BUFFERS];
 static std::atomic_flag g_cl_pool_lock = ATOMIC_FLAG_INIT;
 
-static cl_mem ggml_cl_pool_malloc(size_t size, size_t * actual_size, cl_mem_flags flags) {
+static cl_mem ggml_cl_pool_malloc(const void* ptr, size_t size, size_t * actual_size, cl_mem_flags flags) {
     scoped_spin_lock lock(g_cl_pool_lock);
     cl_int err;
+
+    cl_mem* cl_mem_obj = ggml_cl_host_mem(ptr);
+
+    if (cl_mem_obj != nullptr) {
+        return *cl_mem_obj;
+    }
 
     for (int i = 0; i < MAX_CL_BUFFERS; ++i) {
         cl_buffer& b = g_cl_buffer_pool[i];
@@ -560,9 +586,9 @@ static void ggml_cl_mul_mat_f32(const ggml_tensor * src0, const ggml_tensor * sr
     const int d_ne = ne11 * ne01;
 
     size_t x_size, y_size, d_size;
-    cl_mem d_X = ggml_cl_pool_malloc(sizeof(float) * x_ne, &x_size, CL_MEM_READ_ONLY);
-    cl_mem d_Y = ggml_cl_pool_malloc(sizeof(float) * y_ne, &y_size, CL_MEM_READ_ONLY);
-    cl_mem d_D = ggml_cl_pool_malloc(sizeof(float) * d_ne, &d_size, CL_MEM_WRITE_ONLY);
+    cl_mem d_X = ggml_cl_pool_malloc(src0->data, sizeof(float) * x_ne, &x_size, CL_MEM_READ_ONLY);
+    cl_mem d_Y = ggml_cl_pool_malloc(src1->data, sizeof(float) * y_ne, &y_size, CL_MEM_READ_ONLY);
+    cl_mem d_D = ggml_cl_pool_malloc(nullptr, sizeof(float) * d_ne, &d_size, CL_MEM_WRITE_ONLY);
 
     cl_int err;
 
@@ -629,9 +655,9 @@ static void ggml_cl_mul_mat_f16(const ggml_tensor * src0, const ggml_tensor * sr
     const int d_ne = ne11 * ne01;
 
     size_t x_size, y_size, d_size;
-    cl_mem d_X = ggml_cl_pool_malloc(sizeof(ggml_fp16_t) * x_ne, &x_size, CL_MEM_READ_ONLY);
-    cl_mem d_Y = ggml_cl_pool_malloc(sizeof(ggml_fp16_t) * y_ne, &y_size, CL_MEM_READ_ONLY);
-    cl_mem d_D = ggml_cl_pool_malloc(sizeof(ggml_fp16_t) * d_ne, &d_size, CL_MEM_WRITE_ONLY);
+    cl_mem d_X = ggml_cl_pool_malloc(src0->data, sizeof(ggml_fp16_t) * x_ne, &x_size, CL_MEM_READ_ONLY);
+    cl_mem d_Y = ggml_cl_pool_malloc(src1->data, sizeof(ggml_fp16_t) * y_ne, &y_size, CL_MEM_READ_ONLY);
+    cl_mem d_D = ggml_cl_pool_malloc(nullptr, sizeof(ggml_fp16_t) * d_ne, &d_size, CL_MEM_WRITE_ONLY);
 
     cl_int err;
 
@@ -727,13 +753,13 @@ static void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * 
     size_t x_size, y_size, d_size, q_size;
     cl_mem d_X;
     if (!mul_mat_vec) {
-        d_X = ggml_cl_pool_malloc(sizeof(float) * x_ne, &x_size, CL_MEM_READ_WRITE);
+        d_X = ggml_cl_pool_malloc(src0->data, sizeof(float) * x_ne, &x_size, CL_MEM_READ_WRITE);
     }
-    cl_mem d_Y = ggml_cl_pool_malloc(sizeof(float) * y_ne, &y_size, CL_MEM_READ_ONLY);
-    cl_mem d_D = ggml_cl_pool_malloc(sizeof(float) * d_ne, &d_size, CL_MEM_WRITE_ONLY);
+    cl_mem d_Y = ggml_cl_pool_malloc(src1->data, sizeof(float) * y_ne, &y_size, CL_MEM_READ_ONLY);
+    cl_mem d_D = ggml_cl_pool_malloc(nullptr, sizeof(float) * d_ne, &d_size, CL_MEM_WRITE_ONLY);
     cl_mem d_Q;
     if (src0->backend == GGML_BACKEND_CPU) {
-        d_Q = ggml_cl_pool_malloc(q_sz, &q_size, CL_MEM_READ_ONLY);
+        d_Q = ggml_cl_pool_malloc(src0->data, q_sz, &q_size, CL_MEM_READ_ONLY);
     }
 
     cl_kernel* to_fp32_cl = ggml_get_to_fp32_cl(type);
@@ -892,7 +918,7 @@ void ggml_cl_transform_tensor(ggml_tensor * tensor) {
 
     size_t q_size;
     cl_mem* dst = (cl_mem*) malloc(sizeof(cl_mem));
-    *dst = ggml_cl_pool_malloc(q_sz, &q_size, CL_MEM_READ_ONLY);
+    *dst = ggml_cl_pool_malloc(tensor->data, q_sz, &q_size, CL_MEM_READ_ONLY);
 
     // copy tensor to device
     for (int64_t i3 = 0; i3 < ne3; i3++) {

@@ -473,14 +473,13 @@ struct llama_ctx_buffer {
     uint8_t* addr = NULL;
     bool is_cl;
     size_t size = 0;
-    cl_mem cl_mem_obj;
 
     llama_ctx_buffer() = default;
 
     void resize(size_t size) {
         free();
 
-        addr = (uint8_t *) ggml_cl_host_malloc(size, &cl_mem_obj);
+        addr = (uint8_t *) ggml_cl_host_malloc(size);
         if (addr) {
             is_cl = true;
         } else {
@@ -494,7 +493,7 @@ struct llama_ctx_buffer {
     void free() {
         if (addr) {
             if (is_cl) {
-                ggml_cl_host_free(addr, &cl_mem_obj);
+                ggml_cl_host_free(addr);
             } else {
                 delete[] addr;
             }
