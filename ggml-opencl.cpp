@@ -418,6 +418,8 @@ void ggml_cl_host_free(void* ptr) {
     CL_CHECK(clEnqueueUnmapMemObject(cl_queue, cl_mem_obj, ptr, 0, NULL, NULL), "clEnqueueUnmapMemObject");
     CL_CHECK(clFinish(cl_queue), "clFinish");
     CL_CHECK(clReleaseMemObject(cl_mem_obj), "clReleaseMemObject");
+
+    cl_mem_map.erase(cl_mem_map.find(ptr));
 }
 
 static cl_mem* ggml_cl_host_mem(const void* ptr) {
@@ -530,7 +532,7 @@ static void ggml_cl_pool_free(cl_mem mem, size_t size) {
     clReleaseMemObject(mem);
 }
 
-static cl_int ggml_cl_h2d_tensor_2d(cl_command_queue queue, cl_mem dst, size_t offset, const struct ggml_tensor * src, uint64_t i3, uint64_t i2, cl_event* ev) {
+static void ggml_cl_h2d_tensor_2d(cl_command_queue queue, cl_mem dst, size_t offset, const struct ggml_tensor * src, uint64_t i3, uint64_t i2, cl_event* ev) {
     cl_int err;
     const uint64_t ne0 = src->ne[0];
     const uint64_t ne1 = src->ne[1];
@@ -544,27 +546,23 @@ static cl_int ggml_cl_h2d_tensor_2d(cl_command_queue queue, cl_mem dst, size_t o
 
     const void * x = (const void *) ((const char *) src->data + i2*nb2 + i3*nb3);
     if (nb0 == ts && nb1 == ts*ne0/bs) {
-        err = clEnqueueWriteBuffer(queue, dst, CL_FALSE, offset, ne1*nb1, x, 0, NULL, ev);
-        return err;
+        CL_CHECK(clEnqueueWriteBuffer(queue, dst, CL_FALSE, offset, ne1*nb1, x, 0, NULL, ev), "clEnqueueWriteBuffer");
+        return;
     }
     if (nb0 == ts) {
         const size_t buffer_origin[3] = { offset, 0, 0 };
         const size_t host_origin[3] = { 0, 0, 0 };
         const size_t region[3] = { ts*ne0/bs, ne1, 1 };
-        err = clEnqueueWriteBufferRect(queue, dst, CL_FALSE, buffer_origin, host_origin, region, ts*ne0/bs, 0, nb1, 0, x, 0, NULL, ev);
-        return err;
+        CL_CHECK(clEnqueueWriteBufferRect(queue, dst, CL_FALSE, buffer_origin, host_origin, region, ts*ne0/bs, 0, nb1, 0, x, 0, NULL, ev), "clEnqueueWriteBufferRect");
+        return;
     }
     for (uint64_t i1 = 0; i1 < ne1; i1++) {
         // pretend the row is a matrix with cols=1
         const size_t buffer_origin[3] = { offset, i1, 0 };
         const size_t host_origin[3] = { 0, 0, 0 };
         const size_t region[3] = { ts/bs, ne0, 1 };
-        err = clEnqueueWriteBufferRect(queue, dst, CL_FALSE, buffer_origin, host_origin, region, 0, 0, nb0, 0, ((const char *)x) + i1*nb0, 0, NULL, ev);
-        if (err != CL_SUCCESS) {
-            break;
-        }
+        CL_CHECK(clEnqueueWriteBufferRect(queue, dst, CL_FALSE, buffer_origin, host_origin, region, 0, 0, nb0, 0, ((const char *)x) + i1*nb0, 0, NULL, ev), "clEnqueueWriteBufferRect");
     }
-    return err;
 }
 
 static void ggml_cl_mul_mat_f32(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -590,14 +588,11 @@ static void ggml_cl_mul_mat_f32(const ggml_tensor * src0, const ggml_tensor * sr
     cl_mem d_Y = ggml_cl_pool_malloc(src1->data, sizeof(float) * y_ne, &y_size, CL_MEM_READ_ONLY);
     cl_mem d_D = ggml_cl_pool_malloc(nullptr, sizeof(float) * d_ne, &d_size, CL_MEM_WRITE_ONLY);
 
-    cl_int err;
-
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
             // copy data to device
-            err = ggml_cl_h2d_tensor_2d(cl_queue, d_X, 0, src0, i03, i02, NULL);
-            err |= ggml_cl_h2d_tensor_2d(cl_queue, d_Y, 0, src1, i03, i02, NULL);
-            CL_CHECK(err, "ggml_cl_h2d_tensor_2d");
+            ggml_cl_h2d_tensor_2d(cl_queue, d_X, 0, src0, i03, i02, NULL);
+            ggml_cl_h2d_tensor_2d(cl_queue, d_Y, 0, src1, i03, i02, NULL);
 
             CL_CHECK(clFinish(cl_queue), "clFinish");
 
@@ -619,8 +614,7 @@ static void ggml_cl_mul_mat_f32(const ggml_tensor * src0, const ggml_tensor * sr
 
             // copy dst to host
             float * d = (float *) ((char *) dst->data + i02*nb2 + i03*nb3);
-            err = clEnqueueReadBuffer(cl_queue, d_D, true, 0, sizeof(float) * d_ne, d, 1, &ev_sgemm, NULL);
-            CL_CHECK(err, "clEnqueueReadBuffer");
+            CL_CHECK(clEnqueueReadBuffer(cl_queue, d_D, true, 0, sizeof(float) * d_ne, d, 1, &ev_sgemm, NULL), "clEnqueueReadBuffer");
         }
     }
 
@@ -659,16 +653,13 @@ static void ggml_cl_mul_mat_f16(const ggml_tensor * src0, const ggml_tensor * sr
     cl_mem d_Y = ggml_cl_pool_malloc(src1->data, sizeof(ggml_fp16_t) * y_ne, &y_size, CL_MEM_READ_ONLY);
     cl_mem d_D = ggml_cl_pool_malloc(nullptr, sizeof(ggml_fp16_t) * d_ne, &d_size, CL_MEM_WRITE_ONLY);
 
-    cl_int err;
-
     bool src1_cont_rows = nb10 == sizeof(float);
     bool src1_cont_cols = (size_t)nb11 == ne11*sizeof(float);
 
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
             // copy src0 to device
-            err = ggml_cl_h2d_tensor_2d(cl_queue, d_X, 0, src0, i03, i02, NULL);
-            CL_CHECK(err, "ggml_cl_h2d_tensor_2d");
+            ggml_cl_h2d_tensor_2d(cl_queue, d_X, 0, src0, i03, i02, NULL);
 
             // convert src1 to fp16
             // TODO: use multiple threads
@@ -694,8 +685,7 @@ static void ggml_cl_mul_mat_f16(const ggml_tensor * src0, const ggml_tensor * sr
             }
 
             // copy src1 to device
-            err |= clEnqueueWriteBuffer(cl_queue, d_Y, false, 0, sizeof(ggml_fp16_t) * y_ne, tmp, 0, NULL, NULL);
-            CL_CHECK(err, "ggml_cl_h2d_tensor_2d");
+            CL_CHECK(clEnqueueWriteBuffer(cl_queue, d_Y, false, 0, sizeof(ggml_fp16_t) * y_ne, tmp, 0, NULL, NULL), "clEnqueueWriteBuffer");
 
             CL_CHECK(clFinish(cl_queue), "clFinish");
 
@@ -716,7 +706,7 @@ static void ggml_cl_mul_mat_f16(const ggml_tensor * src0, const ggml_tensor * sr
             }
 
             // copy dst to host, then convert to float
-            err = clEnqueueReadBuffer(cl_queue, d_D, true, 0, sizeof(ggml_fp16_t) * d_ne, tmp, 1, &ev_sgemm, NULL);
+            CL_CHECK(clEnqueueReadBuffer(cl_queue, d_D, true, 0, sizeof(ggml_fp16_t) * d_ne, tmp, 1, &ev_sgemm, NULL), "clEnqueueReadBuffer");
 
             float * d = (float *) ((char *) dst->data + i02*nb2 + i03*nb3);
 
@@ -772,7 +762,7 @@ static void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * 
 
             // copy src0 to device if necessary
             if (src0->backend == GGML_BACKEND_CPU) {
-                CL_CHECK(ggml_cl_h2d_tensor_2d(cl_queue, d_Q, 0, src0, i03, i02, NULL), "ggml_cl_h2d_tensor_2d");
+                ggml_cl_h2d_tensor_2d(cl_queue, d_Q, 0, src0, i03, i02, NULL);
             } else if (src0->backend == GGML_BACKEND_CL) {
                 d_Q = *(cl_mem*) src0->data;
             } else {
@@ -780,7 +770,7 @@ static void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * 
             }
             if (mul_mat_vec) { // specialized dequantize_mul_mat_vec kernel
                 // copy src1 to device
-                CL_CHECK(ggml_cl_h2d_tensor_2d(cl_queue, d_Y, 0, src1, i03, i02, NULL), "ggml_cl_h2d_tensor_2d");
+                ggml_cl_h2d_tensor_2d(cl_queue, d_Y, 0, src1, i03, i02, NULL);
 
                 // compute
                 const size_t global = ne01 * CL_DMMV_BLOCK_SIZE;
@@ -802,7 +792,7 @@ static void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * 
                 CL_CHECK(clEnqueueNDRangeKernel(cl_queue, *to_fp32_cl, 1, NULL, &global, NULL, 0, NULL, NULL), "clEnqueueNDRangeKernel");
 
                 // copy src1 to device
-                CL_CHECK(ggml_cl_h2d_tensor_2d(cl_queue, d_Y, 0, src1, i03, i02, NULL), "ggml_cl_h2d_tensor_2d");
+                ggml_cl_h2d_tensor_2d(cl_queue, d_Y, 0, src1, i03, i02, NULL);
 
                 // wait for conversion
                 CL_CHECK(clFinish(cl_queue), "clFinish");
@@ -924,7 +914,7 @@ void ggml_cl_transform_tensor(ggml_tensor * tensor) {
     for (int64_t i3 = 0; i3 < ne3; i3++) {
         for (int64_t i2 = 0; i2 < ne2; i2++) {
             int i = i3*ne2 + i2;
-            CL_CHECK(ggml_cl_h2d_tensor_2d(cl_queue, *dst, i*ne0*ne1, tensor, i3, i2, NULL), "ggml_cl_h2d_tensor_2d");
+            ggml_cl_h2d_tensor_2d(cl_queue, *dst, i*ne0*ne1, tensor, i3, i2, NULL);
         }
     }
 
