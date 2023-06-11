@@ -403,6 +403,8 @@ void* ggml_cl_host_malloc(size_t size) {
         return nullptr;
     }
 
+    printf("allocate %.2f MB of pinned memory\n", size/1024.0/1024.0);
+
     cl_pinned_memory.push_back(std::make_tuple(ptr, size, cl_mem_obj));
 
     return ptr;
@@ -424,9 +426,9 @@ void ggml_cl_host_free(void* ptr) {
         return;
     }
 
-    // CL_CHECK(clEnqueueUnmapMemObject(cl_queue, *cl_mem_obj, ptr, 0, NULL, NULL), "clEnqueueUnmapMemObject");
-    // CL_CHECK(clFinish(cl_queue), "clFinish");
-    // CL_CHECK(clReleaseMemObject(*cl_mem_obj), "clReleaseMemObject");
+    CL_CHECK(clEnqueueUnmapMemObject(cl_queue, *cl_mem_obj, ptr, 0, NULL, NULL), "clEnqueueUnmapMemObject");
+    CL_CHECK(clFinish(cl_queue), "clFinish");
+    CL_CHECK(clReleaseMemObject(*cl_mem_obj), "clReleaseMemObject");
 }
 
 static cl_mem* ggml_cl_check_pin_submem(const void* ptr, size_t size) {
