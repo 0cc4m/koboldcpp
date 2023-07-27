@@ -1275,22 +1275,22 @@ static void llama_model_load_internal(
 #ifdef GGML_USE_CUBLAS
         const int max_backend_supported_layers = hparams.n_layer + 3;
         const int max_offloadable_layers = low_vram ? hparams.n_layer + 1 : hparams.n_layer + 3;
-        if (n_gpu_layers > (int) hparams.n_layer + 1) {
+        // if (n_gpu_layers > (int) hparams.n_layer + 1) {
             if (low_vram) {
                 fprintf(stderr, "%s: cannot offload v cache to GPU due to low VRAM option\n", __func__);
             } else {
                 fprintf(stderr, "%s: offloading v cache to GPU\n", __func__);
                 vram_kv_cache += hparams.kv_size() / 2;
             }
-        }
-        if (n_gpu_layers > (int) hparams.n_layer + 2) {
+        // }
+        // if (n_gpu_layers > (int) hparams.n_layer + 2) {
             if (low_vram) {
                 fprintf(stderr, "%s: cannot offload k cache to GPU due to low VRAM option\n", __func__);
             } else {
                 fprintf(stderr, "%s: offloading k cache to GPU\n", __func__);
                 vram_kv_cache += hparams.kv_size() / 2;
             }
-        }
+        // }
 #elif defined(GGML_USE_CLBLAST)
         const int max_backend_supported_layers = hparams.n_layer + 1;
         const int max_offloadable_layers = hparams.n_layer + 1;
