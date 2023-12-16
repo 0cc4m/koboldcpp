@@ -1451,6 +1451,9 @@ struct llama_model {
             ggml_cl_free_data(tensors_by_name[i].second);
         }
 #elif defined(GGML_USE_VULKAN)
+        for (size_t i = 0; i < tensors_by_name.size(); ++i) {
+            ggml_vk_free_data(tensors_by_name[i].second);
+        }
         ggml_vk_cleanup();
 #endif
     }
@@ -5981,10 +5984,6 @@ static int llama_decode_internal(
         ggml_vk_preallocate_buffers_graph(gf->nodes[i], gf);
     }
     ggml_vk_preallocate_buffers();
-
-    for (int i = 0; i < gf->n_nodes; i++) {
-        ggml_vk_build_graph(gf->nodes[i], gf);
-    }
 
     // HACK: ggml-alloc may change the tensor backend when reusing a parent, so force output to be on the CPU here if needed
     if (!lctx.embedding.empty()) {
