@@ -208,6 +208,11 @@ mulmat_head = """#version 450
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
 
+#ifdef COOPERATIVE_MATRIX
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#endif
+
 #ifndef LOAD_VEC_A
 #define LOAD_VEC_A 1
 #endif
@@ -243,15 +248,16 @@ layout (push_constant) uniform parameter
     uint batch_stride_d;
 } p;
 
-layout (constant_id = 1) const uint BM = 64;
-layout (constant_id = 2) const uint BN = 64;
+layout (constant_id = 1) const uint BM = 64;  // Block that gets loaded into shared memory together
+layout (constant_id = 2) const uint BN = 64;  // Gets handled by one work group
 layout (constant_id = 3) const uint BK = 16;  // Assumed to be 32 if working with a quant
-layout (constant_id = 4) const uint WM = 32;
+layout (constant_id = 4) const uint WM = 32;  // Block that gets handled by one warp
 layout (constant_id = 5) const uint WN = 32;
-layout (constant_id = 6) const uint WMITER = 2;
-layout (constant_id = 7) const uint TM = 4;
-layout (constant_id = 8) const uint TN = 2;
-layout (constant_id = 9) const uint WARP = 32;
+layout (constant_id = 6) const uint WK = 1;   // Only required for coop mat
+layout (constant_id = 7) const uint WMITER = 2;
+layout (constant_id = 8) const uint TM = 4;   // Block that gets handled by one thread
+layout (constant_id = 9) const uint TN = 2;   // Only relevant for scalar multiplication
+layout (constant_id = 10) const uint WARP = 32;
 
 shared FLOAT_TYPE buf_a[BM * (BK+1)];
 shared FLOAT_TYPE buf_b[BN * (BK+1)];
@@ -271,6 +277,15 @@ void main() {
     const uint ic = gl_WorkGroupID.y;
 
     const uint warp_i = gl_LocalInvocationID.x / WARP;
+
+#ifdef COOPERATIVE_MATRIX
+    const uint CM = BM / WM;  // coop mats per block
+    const uint CN = BN / WN;
+    const uint CK = BK / WK;
+
+    const uint warp_r = warp_i % CM;
+    const uint warp_c = warp_i / CM;
+#else
     const uint warp_r = warp_i % (BM / WM);
     const uint warp_c = warp_i / (BM / WM);
 
@@ -281,6 +296,7 @@ void main() {
     const uint tiw = gl_LocalInvocationID.x % WARP;
     const uint tiwr = tiw % (WSUBM / TM);
     const uint tiwc = tiw / (WSUBM / TM);
+#endif
 
     const uint loadr_a = gl_LocalInvocationID.x % (BK / LOAD_VEC_A);
     const uint loadc_a = gl_LocalInvocationID.x / (BK / LOAD_VEC_A);
@@ -296,6 +312,17 @@ void main() {
     uint pos_a = (batch_idx_a * p.batch_stride_a + ir * BM * p.stride_a + start_k) / LOAD_VEC_A;
     uint pos_b = (gl_GlobalInvocationID.z * p.batch_stride_b + ic * BN * p.stride_b + start_k) / LOAD_VEC_B;
 
+#ifdef COOPERATIVE_MATRIX
+    coopmat<float, gl_ScopeSubgroup, WM, WN, gl_MatrixUseAccumulator> sums[CM][CN];
+    coopmat<float16_t, gl_ScopeSubgroup, WM, WK, gl_MatrixUseA> cache_a[CM];
+    coopmat<float16_t, gl_ScopeSubgroup, WN, WK, gl_MatrixUseB> cache_b[CN];
+
+    [[unroll]] for (uint i = 0; i < CM; i++) {
+        [[unroll]] for (uint j = 0; j < CM; j++) {
+            sums[i][j] = coopmat<float, gl_ScopeSubgroup, WM, WN, gl_MatrixUseAccumulator>(0.0f);
+        }
+    }
+#else
     float sums[WMITER * TM * WNITER * TN];
     FLOAT_TYPE cache_a[WMITER * TM];
     FLOAT_TYPE cache_b[WNITER * TN];
@@ -303,6 +330,7 @@ void main() {
     [[unroll]] for (uint i = 0; i < WMITER*TM*WNITER*TN; i++) {
         sums[i] = 0.0f;
     }
+#endif
 
     [[unroll]] for (uint block = start_k; block < end_k; block += BK) {
         [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {"""
@@ -445,6 +473,24 @@ mulmat_body2 = """
         pos_a += BK / LOAD_VEC_A;
         pos_b += BK / LOAD_VEC_B;
 
+#ifdef COOPERATIVE_MATRIX
+        [[unroll]] for (uint i = 0; i < BK; i += CK) {
+            // Load from shared into cache
+            [[unroll]] for (uint wsir = 0; wsir < CM; wsir++) {
+                // coopMatLoad(cache_a[wsir], buf_a, warp_r * (BK+1) + i, BK + 1, gl_CooperativeMatrixLayoutColumnMajor);
+                cache_a[wsir] = coopmat<float16_t, gl_ScopeSubgroup, WM, WK, gl_MatrixUseA>(1.0f);
+            }
+            [[unroll]] for (uint wsic = 0; wsic < CN; wsic++) {
+                coopMatLoad(cache_b[wsic], buf_b, warp_c * (BK+1) + i, BK + 1, gl_CooperativeMatrixLayoutColumnMajor);
+            }
+
+            [[unroll]] for (uint wsic = 0; wsic < CN; wsic++) {
+                [[unroll]] for (uint wsir = 0; wsir < CM; wsir++) {
+                    sums[wsir][wsic] = coopMatMulAdd(cache_a[wsir], cache_b[wsic], sums[wsir][wsic]);
+                }
+            }
+        }
+#else
         for (uint i = 0; i < BK; i++) {
             // Load from shared into cache
             [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
@@ -468,6 +514,7 @@ mulmat_body2 = """
                 }
             }
         }
+#endif
 
         barrier();
     }
@@ -477,6 +524,9 @@ mulmat_body2 = """
 
     const uint offsets = gl_GlobalInvocationID.z * p.batch_stride_d + ik * p.batch_stride_d * gl_NumWorkGroups.z;
 
+#ifdef COOPERATIVE_MATRIX
+    coopMatStore(sums[warp_r][warp_c], data_d, offsets + dc * p.stride_d + dr, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
+#else
     [[unroll]] for (uint wsic = 0; wsic < WNITER; wsic++) {
         [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
 
@@ -491,6 +541,7 @@ mulmat_body2 = """
             }
         }
     }
+#endif
 }
 """
 
@@ -2312,13 +2363,22 @@ output_dir = gettempdir()
 lock = asyncio.Lock()
 shader_fnames = []
 
+shader_modes = ["float32", "float16", "coop_mat"]
 
-async def string_to_spv(name, code, defines, fp16=True):
+
+async def string_to_spv(name, code, defines, shader_mode="float32"):
     f = NamedTemporaryFile(mode="w", delete=False)
     f.write(code)
     f.flush()
 
-    name = f"{name}{'_fp32' if not fp16 else ''}"
+    mode_name = ""
+
+    if shader_mode == "float16":
+        mode_name = "_fp16"
+    elif shader_mode == "coop_mat":
+        mode_name = "_cm"
+
+    name = f"{name}{mode_name}"
     fname = os.path.join(output_dir, f"{name}.comp")
 
     cmd = [GLSLC, "-fshader-stage=compute", "--target-env=vulkan1.2", "-O", f.name, "-o", fname]
@@ -2369,13 +2429,17 @@ async def main():
 
     stream = []
 
-    for fp16 in (False, True):
-        # mulmat
-        if fp16:
+    # mulmat
+    for mode in shader_modes:
+        defines = {}
+        if mode in ("float16", "coop_mat"):
             shader_float_type = shader_f16
             load_vec = "8"
             vec_type_f16 = "f16mat2x4"
             vec_type = "mat2x4"
+
+            if mode == "coop_mat":
+                defines["COOPERATIVE_MATRIX"] = "1"
         else:
             shader_float_type = shader_f32
             load_vec = "4"
@@ -2384,39 +2448,39 @@ async def main():
 
         stream.clear()
         stream.extend((mulmat_head, shader_float_type, mulmat_body1, mulmat_load_scalar, mulmat_body2))
-        tasks.append(string_to_spv("matmul_f32", "".join(stream), {"A_TYPE": "float", "B_TYPE": "float", "D_TYPE": "float"}, fp16))
-        tasks.append(string_to_spv("matmul_f32_aligned", "".join(stream), {"LOAD_VEC_A": load_vec, "LOAD_VEC_B": load_vec, "A_TYPE": vec_type, "B_TYPE": vec_type, "D_TYPE": "float"}, fp16))
+        tasks.append(string_to_spv("matmul_f32", "".join(stream), dict({"A_TYPE": "float", "B_TYPE": "float", "D_TYPE": "float"}, **defines), mode))
+        tasks.append(string_to_spv("matmul_f32_aligned", "".join(stream), dict({"LOAD_VEC_A": load_vec, "LOAD_VEC_B": load_vec, "A_TYPE": vec_type, "B_TYPE": vec_type, "D_TYPE": "float"}, **defines), mode))
 
-        tasks.append(string_to_spv("matmul_f16", "".join(stream), {"A_TYPE": "float16_t", "B_TYPE": "float16_t", "D_TYPE": "float"}, fp16))
-        tasks.append(string_to_spv("matmul_f16_aligned", "".join(stream), {"LOAD_VEC_A": load_vec, "LOAD_VEC_B": load_vec, "A_TYPE": vec_type_f16, "B_TYPE": vec_type_f16, "D_TYPE": "float"}, fp16))
+        tasks.append(string_to_spv("matmul_f16", "".join(stream), dict({"A_TYPE": "float16_t", "B_TYPE": "float16_t", "D_TYPE": "float"}, **defines), mode))
+        tasks.append(string_to_spv("matmul_f16_aligned", "".join(stream), dict({"LOAD_VEC_A": load_vec, "LOAD_VEC_B": load_vec, "A_TYPE": vec_type_f16, "B_TYPE": vec_type_f16, "D_TYPE": "float"}, **defines), mode))
 
-        tasks.append(string_to_spv("matmul_f16_f32", "".join(stream), {"A_TYPE": "float16_t", "B_TYPE": "float", "D_TYPE": "float"}, fp16))
-        tasks.append(string_to_spv("matmul_f16_f32_aligned", "".join(stream), {"LOAD_VEC_A": load_vec, "LOAD_VEC_B": load_vec, "A_TYPE": vec_type_f16, "B_TYPE": vec_type, "D_TYPE": "float"}, fp16))
+        tasks.append(string_to_spv("matmul_f16_f32", "".join(stream), dict({"A_TYPE": "float16_t", "B_TYPE": "float", "D_TYPE": "float"}, **defines), mode))
+        tasks.append(string_to_spv("matmul_f16_f32_aligned", "".join(stream), dict({"LOAD_VEC_A": load_vec, "LOAD_VEC_B": load_vec, "A_TYPE": vec_type_f16, "B_TYPE": vec_type, "D_TYPE": "float"}, **defines), mode))
 
         stream.clear()
         stream.extend((mulmat_head, shader_int8_ext, shader_float_type, shader_q4_0_defines, mulmat_body1, mulmat_load_q4_0, mulmat_body2))
-        tasks.append(string_to_spv("matmul_q4_0_f32", "".join(stream), {"LOAD_VEC_A": 2, "A_TYPE": "block_q4_0", "B_TYPE": "float", "D_TYPE": "float"}, fp16))
-        tasks.append(string_to_spv("matmul_q4_0_f32_aligned", "".join(stream), {"LOAD_VEC_A": 2, "LOAD_VEC_B": load_vec, "A_TYPE": "block_q4_0", "B_TYPE": vec_type, "D_TYPE": "float"}, fp16))
+        tasks.append(string_to_spv("matmul_q4_0_f32", "".join(stream), dict({"LOAD_VEC_A": 2, "A_TYPE": "block_q4_0", "B_TYPE": "float", "D_TYPE": "float"}, **defines), mode))
+        tasks.append(string_to_spv("matmul_q4_0_f32_aligned", "".join(stream), dict({"LOAD_VEC_A": 2, "LOAD_VEC_B": load_vec, "A_TYPE": "block_q4_0", "B_TYPE": vec_type, "D_TYPE": "float"}, **defines), mode))
 
         stream.clear()
         stream.extend((mulmat_head, shader_int8_ext, shader_float_type, shader_q4_1_defines, mulmat_body1, mulmat_load_q4_1, mulmat_body2))
-        tasks.append(string_to_spv("matmul_q4_1_f32", "".join(stream), {"LOAD_VEC_A": 2, "A_TYPE": "block_q4_1", "B_TYPE": "float", "D_TYPE": "float"}, fp16))
-        tasks.append(string_to_spv("matmul_q4_1_f32_aligned", "".join(stream), {"LOAD_VEC_A": 2, "LOAD_VEC_B": load_vec, "A_TYPE": "block_q4_1", "B_TYPE": vec_type, "D_TYPE": "float"}, fp16))
+        tasks.append(string_to_spv("matmul_q4_1_f32", "".join(stream), dict({"LOAD_VEC_A": 2, "A_TYPE": "block_q4_1", "B_TYPE": "float", "D_TYPE": "float"}, **defines), mode))
+        tasks.append(string_to_spv("matmul_q4_1_f32_aligned", "".join(stream), dict({"LOAD_VEC_A": 2, "LOAD_VEC_B": load_vec, "A_TYPE": "block_q4_1", "B_TYPE": vec_type, "D_TYPE": "float"}, **defines), mode))
 
         stream.clear()
         stream.extend((mulmat_head, shader_int8_ext, shader_float_type, shader_q5_0_defines, mulmat_body1, mulmat_load_q5_0, mulmat_body2))
-        tasks.append(string_to_spv("matmul_q5_0_f32", "".join(stream), {"LOAD_VEC_A": 2, "A_TYPE": "block_q5_0", "B_TYPE": "float", "D_TYPE": "float"}, fp16))
-        tasks.append(string_to_spv("matmul_q5_0_f32_aligned", "".join(stream), {"LOAD_VEC_A": 2, "LOAD_VEC_B": load_vec, "A_TYPE": "block_q5_0", "B_TYPE": vec_type, "D_TYPE": "float"}, fp16))
+        tasks.append(string_to_spv("matmul_q5_0_f32", "".join(stream), dict({"LOAD_VEC_A": 2, "A_TYPE": "block_q5_0", "B_TYPE": "float", "D_TYPE": "float"}, **defines), mode))
+        tasks.append(string_to_spv("matmul_q5_0_f32_aligned", "".join(stream), dict({"LOAD_VEC_A": 2, "LOAD_VEC_B": load_vec, "A_TYPE": "block_q5_0", "B_TYPE": vec_type, "D_TYPE": "float"}, **defines), mode))
 
         stream.clear()
         stream.extend((mulmat_head, shader_int8_ext, shader_float_type, shader_q5_1_defines, mulmat_body1, mulmat_load_q5_1, mulmat_body2))
-        tasks.append(string_to_spv("matmul_q5_1_f32", "".join(stream), {"LOAD_VEC_A": 2, "A_TYPE": "block_q5_1", "B_TYPE": "float", "D_TYPE": "float"}, fp16))
-        tasks.append(string_to_spv("matmul_q5_1_f32_aligned", "".join(stream), {"LOAD_VEC_A": 2, "LOAD_VEC_B": load_vec, "A_TYPE": "block_q5_1", "B_TYPE": vec_type, "D_TYPE": "float"}, fp16))
+        tasks.append(string_to_spv("matmul_q5_1_f32", "".join(stream), dict({"LOAD_VEC_A": 2, "A_TYPE": "block_q5_1", "B_TYPE": "float", "D_TYPE": "float"}, **defines), mode))
+        tasks.append(string_to_spv("matmul_q5_1_f32_aligned", "".join(stream), dict({"LOAD_VEC_A": 2, "LOAD_VEC_B": load_vec, "A_TYPE": "block_q5_1", "B_TYPE": vec_type, "D_TYPE": "float"}, **defines), mode))
 
         stream.clear()
         stream.extend((mulmat_head, shader_int8_ext, shader_float_type, shader_q8_0_defines, mulmat_body1, mulmat_load_q8_0, mulmat_body2))
-        tasks.append(string_to_spv("matmul_q8_0_f32", "".join(stream), {"LOAD_VEC_A": 2, "A_TYPE": "block_q8_0", "B_TYPE": "float", "D_TYPE": "float"}, fp16))
-        tasks.append(string_to_spv("matmul_q8_0_f32_aligned", "".join(stream), {"LOAD_VEC_A": 2, "LOAD_VEC_B": load_vec, "A_TYPE": "block_q8_0", "B_TYPE": vec_type, "D_TYPE": "float"}, fp16))
+        tasks.append(string_to_spv("matmul_q8_0_f32", "".join(stream), dict({"LOAD_VEC_A": 2, "A_TYPE": "block_q8_0", "B_TYPE": "float", "D_TYPE": "float"}, **defines), mode))
+        tasks.append(string_to_spv("matmul_q8_0_f32_aligned", "".join(stream), dict({"LOAD_VEC_A": 2, "LOAD_VEC_B": load_vec, "A_TYPE": "block_q8_0", "B_TYPE": vec_type, "D_TYPE": "float"}, **defines), mode))
 
     # Shaders where precision is needed, so no fp16 version
 
